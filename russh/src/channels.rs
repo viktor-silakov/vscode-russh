@@ -373,11 +373,15 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
         let (stream, mut r_rx, w_tx) = ChannelStream::new();
 
         tokio::spawn(async move {
+            // Data to send that waits for the window. It is sent here, not with
+            // `data`, which waits for the window by reading the channel's
+            // messages and drops the data that arrives meanwhile.
+            let mut queued: Vec<u8> = Vec::new();
             loop {
                 tokio::select! {
-                    data = r_rx.recv() => {
+                    data = r_rx.recv(), if queued.is_empty() => {
                         match data {
-                            Some(data) if !data.is_empty() => self.data(&data[..]).await?,
+                            Some(data) if !data.is_empty() => queued = data,
                             Some(_) => {
                                 log::debug!("closing chan {:?}, received empty data", &self.id);
                                 self.eof().await?;
@@ -405,9 +409,80 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
                         }
                     }
                 }
+                while !queued.is_empty() && self.window_size > 0 {
+                    let n = queued
+                        .len()
+                        .min(self.window_size.min(self.max_packet_size) as usize);
+                    let chunk = CryptoVec::from_slice(&queued[..n]);
+                    queued.drain(..n);
+                    self.window_size -= n as u32;
+                    self.send_data_packet(None, chunk).await?;
+                }
             }
             Ok::<_, crate::Error>(())
         });
         stream
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
+
+    struct Sent(ChannelMsg);
+
+    impl From<(ChannelId, ChannelMsg)> for Sent {
+        fn from((_, msg): (ChannelId, ChannelMsg)) -> Self {
+            Sent(msg)
+        }
+    }
+
+    async fn next_data(sent: &mut mpsc::Receiver<Sent>) -> Vec<u8> {
+        match sent.recv().await {
+            Some(Sent(ChannelMsg::Data { data })) => data.to_vec(),
+            Some(Sent(msg)) => panic!("expected data, got {:?}", msg),
+            None => panic!("the stream stopped sending"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_reads_data_while_a_write_waits_for_the_window() {
+        let (sender, mut sent) = mpsc::channel(16);
+        let (incoming, receiver) = mpsc::unbounded_channel();
+        let channel = Channel {
+            id: ChannelId(0),
+            sender,
+            receiver,
+            max_packet_size: 1024,
+            window_size: 4,
+        };
+        let mut stream = channel.into_stream();
+
+        stream.write_all(b"0123456789").await.unwrap();
+        assert_eq!(next_data(&mut sent).await, b"0123");
+
+        // The rest of the write waits for the window; data that arrives
+        // meanwhile still reaches the reader.
+        incoming
+            .send(ChannelMsg::Data {
+                data: CryptoVec::from_slice(b"reply"),
+            })
+            .unwrap();
+        let mut reply = [0u8; 5];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut reply),
+        )
+        .await
+        .expect("the data that arrived while the window was full was lost")
+        .unwrap();
+        assert_eq!(&reply, b"reply");
+
+        incoming
+            .send(ChannelMsg::WindowAdjusted { new_size: 100 })
+            .unwrap();
+        assert_eq!(next_data(&mut sent).await, b"456789");
     }
 }
